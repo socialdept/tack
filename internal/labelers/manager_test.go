@@ -3,6 +3,7 @@ package labelers
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -30,11 +31,15 @@ const labelerDID = "did:plc:labeler"
 type fakeLabeler struct {
 	t           *testing.T
 	declaration string
-	key         *atcrypto.PrivateKeyK256
-	server      *httptest.Server
-	mu          sync.Mutex
-	frames      [][]byte
-	cursors     []string
+	// history is what queryLabels serves, in the order given.
+	history   []*comatproto.LabelDefs_Label
+	wildcards bool
+	queries   [][]string
+	key       *atcrypto.PrivateKeyK256
+	server    *httptest.Server
+	mu        sync.Mutex
+	frames    [][]byte
+	cursors   []string
 }
 
 func newFakeLabeler(t *testing.T) *fakeLabeler {
@@ -79,6 +84,42 @@ func newFakeLabeler(t *testing.T) *fakeLabeler {
 		// Hold the stream open, as a labeler with nothing new does.
 		_, _, _ = conn.ReadMessage()
 	})
+	mux.HandleFunc("/xrpc/com.atproto.label.queryLabels", func(w http.ResponseWriter, r *http.Request) {
+		patterns := r.URL.Query()["uriPatterns"]
+
+		f.mu.Lock()
+		f.queries = append(f.queries, patterns)
+		history := append([]*comatproto.LabelDefs_Label(nil), f.history...)
+		wildcards := f.wildcards
+		f.mu.Unlock()
+
+		out := []map[string]any{}
+		for _, p := range patterns {
+			if strings.Contains(p, "*") && !wildcards {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":"InvalidRequest","message":"Support for wildcard label queries is temporarily disabled"}`)
+
+				return
+			}
+		}
+
+		for _, l := range history {
+			for _, p := range patterns {
+				prefix, wild := strings.CutSuffix(p, "*")
+				if l.Uri == p || (wild && strings.HasPrefix(l.Uri, prefix)) {
+					entry := map[string]any{"ver": 1, "src": l.Src, "uri": l.Uri, "val": l.Val, "cts": l.Cts, "sig": map[string]string{"$bytes": base64.RawStdEncoding.EncodeToString(l.Sig)}}
+					if l.Neg != nil {
+						entry["neg"] = *l.Neg
+					}
+					out = append(out, entry)
+
+					break
+				}
+			}
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"labels": out})
+	})
 	f.server = httptest.NewServer(mux)
 	t.Cleanup(f.server.Close)
 
@@ -105,9 +146,13 @@ func (f *fakeLabeler) directory() identity.Directory {
 
 // label builds a signed label, or one signed by another key when forged.
 func (f *fakeLabeler) label(uri, val string, neg, forged bool) *comatproto.LabelDefs_Label {
+	return f.labelAt(uri, val, neg, forged, time.Now().UTC())
+}
+
+func (f *fakeLabeler) labelAt(uri, val string, neg, forged bool, at time.Time) *comatproto.LabelDefs_Label {
 	f.t.Helper()
 
-	l := labeling.Label{SourceDID: labelerDID, URI: uri, Val: val, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Version: labeling.ATPROTO_LABEL_VERSION}
+	l := labeling.Label{SourceDID: labelerDID, URI: uri, Val: val, CreatedAt: at.Format("2006-01-02T15:04:05.000Z"), Version: labeling.ATPROTO_LABEL_VERSION}
 	if neg {
 		l.Negated = &neg
 	}
@@ -372,5 +417,131 @@ func TestEveryAccountMeansEveryLabelDeliveredAndNoneKept(t *testing.T) {
 	counts, _ := s.Counts()
 	if labels != 2 || counts["labels"] != 0 {
 		t.Errorf("delivered %d and kept %d, want 2 and 0", labels, counts["labels"])
+	}
+}
+
+// liveLabels returns the label values the outbox holds for delivery.
+func liveVals(t *testing.T, s *store.Store) map[string]bool {
+	t.Helper()
+
+	vals := map[string]bool{}
+	for _, e := range queued(t, s) {
+		if e["type"] == "label" {
+			l := e["label"].(map[string]any)
+			vals[l["uri"].(string)+" "+l["val"].(string)] = l["neg"] != true
+		}
+	}
+
+	return vals
+}
+
+func TestANewSubjectsLabelsAreFetchedWithAWildcardWhereTheLabelerTakesOne(t *testing.T) {
+	f := newFakeLabeler(t)
+	f.wildcards = true
+	day := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	f.history = []*comatproto.LabelDefs_Label{
+		// A withdrawal served before the label it withdraws, as Ozone may.
+		f.labelAt("at://did:plc:alice/app.example.post/1", "graphic", true, false, day.Add(2*time.Hour)),
+		f.labelAt("at://did:plc:alice/app.example.post/1", "graphic", false, false, day),
+		f.labelAt("did:plc:alice", "spam", false, false, day),
+		f.labelAt("at://did:plc:alice/app.example.post/2", "porn", false, false, day),
+		f.labelAt("did:plc:alice", "forged", false, true, day),
+		f.labelAt("did:plc:bob", "spam", false, false, day),
+	}
+	m, s := setup(t, f)
+	_, _ = s.AddLabeler(labelerDID)
+	_, _ = s.AddSubjects([]string{"did:plc:alice"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Backfill(ctx, 1)
+
+	waitFor(t, "alice to be backfilled", func() bool {
+		sub, _ := s.Subject("did:plc:alice")
+		return sub != nil && sub.BackfilledAt != nil
+	})
+
+	labels, _ := s.LabelsFor("did:plc:alice")
+	got := map[string]bool{}
+	for _, l := range labels {
+		got[l.URI+" "+l.Val] = true
+	}
+
+	want := map[string]bool{"did:plc:alice spam": true, "at://did:plc:alice/app.example.post/2 porn": true}
+	if len(got) != len(want) || !got["did:plc:alice spam"] || !got["at://did:plc:alice/app.example.post/2 porn"] {
+		t.Errorf("stored %v, want %v: the withdrawn and forged labels dropped", got, want)
+	}
+
+	if vals := liveVals(t, s); !vals["did:plc:alice spam"] || !vals["at://did:plc:alice/app.example.post/2 porn"] {
+		t.Errorf("queued %v", vals)
+	}
+
+	l, _ := s.Labeler(labelerDID)
+	if l.Wildcards == nil || !*l.Wildcards {
+		t.Error("the labeler was not recorded as taking wildcards")
+	}
+}
+
+func TestALabelerWithoutWildcardsIsAskedAboutTheRecordURIsTheAppSends(t *testing.T) {
+	f := newFakeLabeler(t)
+	day := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	f.history = []*comatproto.LabelDefs_Label{
+		f.labelAt("did:plc:alice", "spam", false, false, day),
+		f.labelAt("at://did:plc:alice/app.example.post/1", "graphic", false, false, day),
+	}
+	m, s := setup(t, f)
+	_, _ = s.AddLabeler(labelerDID)
+	_, _ = s.AddSubjects([]string{"did:plc:alice"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Backfill(ctx, 1)
+
+	waitFor(t, "alice to be backfilled", func() bool {
+		sub, _ := s.Subject("did:plc:alice")
+		return sub != nil && sub.BackfilledAt != nil
+	})
+
+	if labels, _ := s.LabelsFor("did:plc:alice"); len(labels) != 1 || labels[0].Val != "spam" {
+		t.Fatalf("labels = %+v, want the account label only so far", labels)
+	}
+
+	l, _ := s.Labeler(labelerDID)
+	if l.Wildcards == nil || *l.Wildcards {
+		t.Fatal("the labeler was not recorded as refusing wildcards")
+	}
+
+	_, _ = s.AddPendingURIs([]string{"at://did:plc:alice/app.example.post/1"})
+	m.WakeBackfill()
+
+	waitFor(t, "the record label", func() bool {
+		labels, _ := s.LabelsFor("did:plc:alice")
+		return len(labels) == 2
+	})
+
+	if pending, _ := s.PendingURIs(10); len(pending) != 0 {
+		t.Errorf("pending = %+v", pending)
+	}
+
+	// The refusal is remembered: later subjects skip the wildcard query.
+	f.mu.Lock()
+	f.queries = nil
+	f.mu.Unlock()
+	_, _ = s.AddSubjects([]string{"did:plc:carol"})
+	m.WakeBackfill()
+
+	waitFor(t, "carol to be backfilled", func() bool {
+		sub, _ := s.Subject("did:plc:carol")
+		return sub != nil && sub.BackfilledAt != nil
+	})
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, q := range f.queries {
+		for _, p := range q {
+			if strings.Contains(p, "*") {
+				t.Errorf("asked with a wildcard again: %v", q)
+			}
+		}
 	}
 }
