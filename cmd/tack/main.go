@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -93,6 +94,19 @@ func run(log *slog.Logger) error {
 
 	go manager.Backfill(ctx, envInt("TACK_BACKFILL_WORKERS", 4))
 	go sweep(ctx, s, log)
+
+	// Go's profiler, for finding what Tack spends its time on. Off unless an
+	// address is given, and best kept on localhost.
+	if addr := os.Getenv("TACK_PPROF_ADDR"); addr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/heap", pprof.Index)
+		go func() {
+			log.Info("profiler listening", "addr", addr)
+			_ = http.ListenAndServe(addr, mux)
+		}()
+	}
 
 	api := &server.Server{Context: ctx, Store: s, Labelers: manager, Password: os.Getenv("TACK_ADMIN_PASSWORD")}
 	if box.Mode != outbox.ModeWebhook {
