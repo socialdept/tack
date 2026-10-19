@@ -62,12 +62,16 @@ func run(log *slog.Logger) error {
 
 	identity.DefaultPLCURL = env("TACK_PLC_URL", identity.DefaultPLCURL)
 
-	deliverer := &outbox.Deliverer{
-		Store:     s,
-		URL:       os.Getenv("TACK_WEBHOOK_URL"),
-		Password:  os.Getenv("TACK_ADMIN_PASSWORD"),
-		BatchSize: envInt("TACK_WEBHOOK_BATCH_SIZE", 100),
-		Log:       log.With("part", "webhook"),
+	box := &outbox.Outbox{
+		Store:        s,
+		Log:          log.With("part", "outbox"),
+		Mode:         outbox.ModeFor(os.Getenv("TACK_WEBHOOK_URL"), envBool("TACK_DISABLE_ACKS", false)),
+		URL:          os.Getenv("TACK_WEBHOOK_URL"),
+		Password:     os.Getenv("TACK_ADMIN_PASSWORD"),
+		BatchSize:    envInt("TACK_WEBHOOK_BATCH_SIZE", 0),
+		Flush:        envDuration("TACK_WEBHOOK_BATCH_FLUSH", 500*time.Millisecond),
+		Parallelism:  envInt("TACK_WEBHOOK_BATCH_PARALLELISM", 1),
+		RetryTimeout: envDuration("TACK_RETRY_TIMEOUT", time.Minute),
 	}
 
 	manager := &labelers.Manager{
@@ -76,7 +80,7 @@ func run(log *slog.Logger) error {
 		Verify:      envBool("TACK_VERIFY", true),
 		AllSubjects: envBool("TACK_ALL_SUBJECTS", false),
 		Log:         log.With("part", "labelers"),
-		Notify:      deliverer.Wake,
+		Notify:      box.Wake,
 		QueryRate:   envFloat("TACK_QUERY_RATE", 4),
 	}
 
@@ -84,16 +88,16 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	if deliverer.URL == "" {
-		log.Warn("TACK_WEBHOOK_URL is not set: labels are stored and queued, but not delivered")
-	} else {
-		go deliverer.Run(ctx)
-	}
+	go box.Run(ctx)
+	log.Info("delivering", "mode", box.Mode)
 
 	go manager.Backfill(ctx, envInt("TACK_BACKFILL_WORKERS", 4))
 	go sweep(ctx, s, log)
 
 	api := &server.Server{Context: ctx, Store: s, Labelers: manager, Password: os.Getenv("TACK_ADMIN_PASSWORD")}
+	if box.Mode != outbox.ModeWebhook {
+		api.Channel = &outbox.Channel{Outbox: box}
+	}
 	if api.Password == "" {
 		log.Warn("TACK_ADMIN_PASSWORD is not set: the admin API is open to anyone who can reach it")
 	}
@@ -174,6 +178,14 @@ func env(key, fallback string) string {
 
 func envInt(key string, fallback int) int {
 	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
+		return v
+	}
+
+	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v, err := time.ParseDuration(os.Getenv(key)); err == nil {
 		return v
 	}
 

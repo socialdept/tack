@@ -24,6 +24,9 @@ type Server struct {
 	Store    *store.Store
 	Labelers *labelers.Manager
 	Password string
+
+	// Channel serves /channel in the websocket delivery modes.
+	Channel http.Handler
 }
 
 // Handler returns the routes.
@@ -41,6 +44,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /subjects/remove", s.auth(s.removeSubjects))
 	mux.HandleFunc("POST /subjects/uris", s.auth(s.addURIs))
 	mux.HandleFunc("GET /subjects/{did}", s.auth(s.subject))
+
+	if s.Channel != nil {
+		mux.HandleFunc("GET /channel", s.auth(s.Channel.ServeHTTP))
+	}
 
 	return mux
 }
