@@ -22,12 +22,10 @@ import (
 )
 
 // defaultLabelers are followed on first start, unless TACK_LABELERS says
-// otherwise: Bluesky Moderation, Blacksky, Skywatch and Hailey's Labeler.
+// otherwise: Bluesky Moderation and Blacksky.
 var defaultLabelers = []string{
 	"did:plc:ar7c4by46qjdydhdevvrndac",
 	"did:plc:d2mkddsbmnrgr3domzg5qexf",
-	"did:plc:e4elbtctnfqocyfcml6h2lf7",
-	"did:plc:saslbwamakedc4h6c5bmshvz",
 }
 
 func main() {

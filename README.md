@@ -41,7 +41,7 @@ docker run -p 2490:2490 -v tack-data:/data \
 | `TACK_WEBHOOK_BATCH_PARALLELISM` | `1` | Webhook requests in flight at once |
 | `TACK_DISABLE_ACKS` | `false` | On the websocket, count an event as delivered once it is written, without waiting for an ack |
 | `TACK_RETRY_TIMEOUT` | `60s` | How long an event sent over the websocket waits for its ack before it is sent again |
-| `TACK_LABELERS` | four, below | Comma-separated labeler DIDs to follow on first start |
+| `TACK_LABELERS` | two, below | Comma-separated labeler DIDs to follow on first start |
 | `TACK_VERIFY` | `true` | Drop labels whose signature does not verify |
 | `TACK_ALL_SUBJECTS` | `false` | Deliver every label from the streams, about any account, without storing any |
 | `TACK_BACKFILL_WORKERS` | `4` | Subjects fetched at once |
@@ -56,8 +56,6 @@ On first start Tack follows `TACK_LABELERS`, or these:
 | --- | --- |
 | Bluesky Moderation | `did:plc:ar7c4by46qjdydhdevvrndac` |
 | Blacksky | `did:plc:d2mkddsbmnrgr3domzg5qexf` |
-| Skywatch | `did:plc:e4elbtctnfqocyfcml6h2lf7` |
-| Hailey's Labeler | `did:plc:saslbwamakedc4h6c5bmshvz` |
 
 After that the admin API decides, so a labeler removed through it stays removed across restarts.
 
