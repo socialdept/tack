@@ -213,8 +213,8 @@ func TestLabelsAreVerifiedStoredAndQueuedOnlyForSubjects(t *testing.T) {
 	})
 
 	counts, _ := s.Counts()
-	if counts["labels"] != 2 {
-		t.Errorf("stored %d labels, want 2: the forged one is dropped, the stranger's kept", counts["labels"])
+	if counts["labels"] != 1 {
+		t.Errorf("stored %d labels, want 1: the forged one dropped, the stranger's not kept", counts["labels"])
 	}
 
 	l, _ := s.Labeler(labelerDID)
@@ -292,8 +292,9 @@ func TestANegationIsQueuedAndTheCursorResumes(t *testing.T) {
 		return len(f.cursors) == 2
 	})
 
-	if f.cursors[0] != "0" || f.cursors[1] != "8" {
-		t.Errorf("cursors = %v, want 0 then 8", f.cursors)
+	// The first connection starts at the labeler's current label.
+	if f.cursors[0] != "" || f.cursors[1] != "8" {
+		t.Errorf("cursors = %q, want none then 8", f.cursors)
 	}
 }
 
@@ -343,4 +344,33 @@ func TestAChangedDeclarationIsSentWhileConnected(t *testing.T) {
 	f.mu.Unlock()
 
 	waitFor(t, "the changed declaration", func() bool { return len(queued(t, s)) == 2 })
+}
+
+func TestEveryAccountMeansEveryLabelDeliveredAndNoneKept(t *testing.T) {
+	f := newFakeLabeler(t)
+	m, s := setup(t, f)
+	m.AllSubjects = true
+
+	f.send(1, f.label("did:plc:stranger", "spam", false, false), f.label("did:plc:other", "spam", false, false))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = m.Add(ctx, labelerDID)
+
+	waitFor(t, "the frame", func() bool {
+		l, _ := s.Labeler(labelerDID)
+		return l != nil && l.Cursor == 1
+	})
+
+	labels := 0
+	for _, e := range queued(t, s) {
+		if e["type"] == "label" {
+			labels++
+		}
+	}
+
+	counts, _ := s.Counts()
+	if labels != 2 || counts["labels"] != 0 {
+		t.Errorf("delivered %d and kept %d, want 2 and 0", labels, counts["labels"])
+	}
 }

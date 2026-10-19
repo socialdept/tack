@@ -292,7 +292,12 @@ func streamURL(endpoint string, cursor int64) (string, error) {
 	}
 
 	u.Path = strings.TrimRight(u.Path, "/") + "/xrpc/com.atproto.label.subscribeLabels"
-	u.RawQuery = url.Values{"cursor": {fmt.Sprint(cursor)}}.Encode()
+
+	// No cursor yet: start at the labeler's current label, not its first.
+	// Labels from before are fetched per subject, when one is added.
+	if cursor > 0 {
+		u.RawQuery = url.Values{"cursor": {fmt.Sprint(cursor)}}.Encode()
+	}
 
 	return u.String(), nil
 }
@@ -376,8 +381,26 @@ func (m *Manager) check(ctx context.Context, did string, who *labelerIdentity, l
 	return true, nil
 }
 
+// store keeps a label about a subject and queues it when it changed what
+// Tack holds. Labels about anyone else are dropped, unless every account is
+// wanted, in which case each is delivered as it comes and none is kept.
 func (m *Manager) store(tx *store.Store, label labeling.Label, verified bool) error {
 	negated := label.Negated != nil && *label.Negated
+	payload := LabelPayload{
+		Src: label.SourceDID, URI: label.URI, CID: label.CID, Val: label.Val,
+		Neg: negated, Cts: label.CreatedAt, Exp: label.ExpiresAt,
+	}
+
+	if m.AllSubjects {
+		return EnqueueLabel(tx, payload, verified)
+	}
+
+	subject := store.SubjectOf(label.URI)
+
+	tracked, err := tx.IsSubject(subject)
+	if err != nil || !tracked {
+		return err
+	}
 
 	var exp *time.Time
 	if label.ExpiresAt != nil {
@@ -387,8 +410,6 @@ func (m *Manager) store(tx *store.Store, label labeling.Label, verified bool) er
 		}
 	}
 
-	subject := store.SubjectOf(label.URI)
-
 	changed, err := tx.PutLabel(store.Label{
 		Src: label.SourceDID, URI: label.URI, Val: label.Val, Subject: subject,
 		CID: label.CID, Cts: label.CreatedAt, Exp: exp, Sig: label.Sig, Verified: verified,
@@ -397,21 +418,7 @@ func (m *Manager) store(tx *store.Store, label labeling.Label, verified bool) er
 		return err
 	}
 
-	wanted := m.AllSubjects
-	if !wanted {
-		if wanted, err = tx.IsSubject(subject); err != nil {
-			return err
-		}
-	}
-
-	if !wanted {
-		return nil
-	}
-
-	return EnqueueLabel(tx, LabelPayload{
-		Src: label.SourceDID, URI: label.URI, CID: label.CID, Val: label.Val,
-		Neg: negated, Cts: label.CreatedAt, Exp: label.ExpiresAt,
-	}, verified)
+	return EnqueueLabel(tx, payload, verified)
 }
 
 // refreshDeclaration reads the labeler's app.bsky.labeler.service record
