@@ -68,3 +68,36 @@ func FromStored(l store.Label) LabelPayload {
 
 	return LabelPayload{Src: l.Src, URI: l.URI, CID: l.CID, Val: l.Val, Cts: l.Cts, Exp: exp}
 }
+
+// AddSubjects records DIDs as subjects and queues every label already
+// stored about the new ones, as Tap backfills a repo it starts tracking.
+// It returns the DIDs that were new and how many labels were queued.
+func AddSubjects(s *store.Store, dids []string) ([]string, int, error) {
+	var added []string
+	queued := 0
+
+	err := s.Tx(func(tx *store.Store) error {
+		var err error
+		if added, err = tx.AddSubjects(dids); err != nil {
+			return err
+		}
+
+		for _, did := range added {
+			labels, err := tx.LabelsFor(did)
+			if err != nil {
+				return err
+			}
+
+			for _, l := range labels {
+				if err := EnqueueLabel(tx, FromStored(l), l.Verified); err != nil {
+					return err
+				}
+				queued++
+			}
+		}
+
+		return nil
+	})
+
+	return added, queued, err
+}
