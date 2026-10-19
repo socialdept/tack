@@ -42,7 +42,22 @@ func (m *Manager) Backfill(ctx context.Context, workers int) {
 	m.backfillInit()
 
 	var wg sync.WaitGroup
-	for range workers {
+
+	// With more than one worker, one keeps asking about pending record URIs
+	// while the rest fetch new subjects, so neither waits for the other: an
+	// app registering many accounts at once would otherwise see no record
+	// labels until every account was fetched.
+	subjectWorkers := workers
+	if workers > 1 {
+		subjectWorkers--
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.pendingWorker(ctx)
+		}()
+	}
+
+	for range subjectWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -92,6 +107,33 @@ func (m *Manager) backfillWorker(ctx context.Context) {
 		// same URIs at once would only repeat each other.
 		checked := 0
 		if m.pendingMu.TryLock() {
+			checked, err = m.checkPendingURIs(ctx)
+			m.pendingMu.Unlock()
+
+			if err != nil {
+				m.Log.Warn("could not check pending record URIs", "err", err)
+			}
+		}
+
+		if checked > 0 {
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+		case <-m.backfillWake:
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// pendingWorker only asks about pending record URIs.
+func (m *Manager) pendingWorker(ctx context.Context) {
+	for ctx.Err() == nil {
+		checked := 0
+
+		if m.pendingMu.TryLock() {
+			var err error
 			checked, err = m.checkPendingURIs(ctx)
 			m.pendingMu.Unlock()
 

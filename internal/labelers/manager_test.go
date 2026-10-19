@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -592,5 +593,39 @@ func TestStreamLabelsAboutOtherAccountsAreSkippedBeforeTheirSignatureIsChecked(t
 
 	if l, _ := s.Labeler(labelerDID); l.Rejected != 0 || l.Received != 1 {
 		t.Errorf("received=%d rejected=%d, want 1 and 0", l.Received, l.Rejected)
+	}
+}
+
+func TestPendingURIsAreAskedAboutWhileSubjectsAreStillBeingFetched(t *testing.T) {
+	f := newFakeLabeler(t)
+	day := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	f.history = []*comatproto.LabelDefs_Label{f.labelAt("at://did:plc:alice/app.example.post/1", "graphic", false, false, day)}
+	m, s := setup(t, f)
+	m.QueryRate = 1e6
+	_, _ = s.AddLabeler(labelerDID)
+	wildcards := false
+	_ = s.UpdateLabeler(labelerDID, map[string]any{"status": "connected", "wildcards": &wildcards})
+
+	// Alice is fetched already. Thousands of others wait to be.
+	_, _ = s.AddSubjects([]string{"did:plc:alice"})
+	_ = s.MarkBackfilled("did:plc:alice")
+	others := make([]string, 2000)
+	for i := range others {
+		others[i] = fmt.Sprintf("did:plc:other%04d", i)
+	}
+	_, _ = s.AddSubjects(others)
+	_, _ = s.AddPendingURIs([]string{"at://did:plc:alice/app.example.post/1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Backfill(ctx, 4)
+
+	waitFor(t, "alice's record label", func() bool {
+		labels, _ := s.LabelsFor("did:plc:alice")
+		return len(labels) == 1
+	})
+
+	if counts, _ := s.Counts(); counts["backfilled"] >= 2001 {
+		t.Error("the record label only came once every subject was fetched")
 	}
 }

@@ -343,6 +343,13 @@ func (s *Store) Counts() (map[string]int64, error) {
 		counts[name] = n
 	}
 
+	var backfilled int64
+	if err := s.DB.Model(&Subject{}).Where("backfilled_at IS NOT NULL").Count(&backfilled).Error; err != nil {
+		return nil, err
+	}
+
+	counts["backfilled"] = backfilled
+
 	return counts, nil
 }
 
