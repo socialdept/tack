@@ -50,6 +50,7 @@ type Manager struct {
 	QueryRate float64
 
 	mu           sync.Mutex
+	pendingMu    sync.Mutex // one worker checks pending URIs at a time
 	running      map[string]context.CancelFunc
 	backfillWake chan struct{}
 	inFlight     map[string]bool
@@ -323,6 +324,19 @@ func (m *Manager) handleLabels(ctx context.Context, did string, who *labelerIden
 
 			label := labeling.FromLexicon(lex)
 			received++
+
+			// Most of a labeler's labels are about accounts the app does not
+			// know: skip them before spending a signature check on them.
+			if !m.AllSubjects {
+				wanted, err := tx.IsSubject(store.SubjectOf(label.URI))
+				if err != nil {
+					return err
+				}
+
+				if !wanted {
+					continue
+				}
+			}
 
 			verified, err := m.check(ctx, did, who, &label)
 			if err != nil {
