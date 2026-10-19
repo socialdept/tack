@@ -1,0 +1,8 @@
+.DS_Store
+.idea
+/tack
+/data/
+*.db
+*.db-shm
+*.db-wal
+.env
