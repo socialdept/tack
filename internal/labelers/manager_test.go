@@ -450,6 +450,8 @@ func TestANewSubjectsLabelsAreFetchedWithAWildcardWhereTheLabelerTakesOne(t *tes
 	}
 	m, s := setup(t, f)
 	_, _ = s.AddLabeler(labelerDID)
+	// Its stream is up: backfill asks only labelers that answer.
+	_ = s.UpdateLabeler(labelerDID, map[string]any{"status": "connected"})
 	_, _ = s.AddSubjects([]string{"did:plc:alice"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -491,6 +493,8 @@ func TestALabelerWithoutWildcardsIsAskedAboutTheRecordURIsTheAppSends(t *testing
 	}
 	m, s := setup(t, f)
 	_, _ = s.AddLabeler(labelerDID)
+	// Its stream is up: backfill asks only labelers that answer.
+	_ = s.UpdateLabeler(labelerDID, map[string]any{"status": "connected"})
 	_, _ = s.AddSubjects([]string{"did:plc:alice"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -543,5 +547,50 @@ func TestALabelerWithoutWildcardsIsAskedAboutTheRecordURIsTheAppSends(t *testing
 				t.Errorf("asked with a wildcard again: %v", q)
 			}
 		}
+	}
+}
+
+func TestALabelerWhoseStreamIsDownIsNotAskedDuringBackfill(t *testing.T) {
+	f := newFakeLabeler(t)
+	m, s := setup(t, f)
+	_, _ = s.AddLabeler(labelerDID)
+	_ = s.UpdateLabeler(labelerDID, map[string]any{"status": "error"})
+	_, _ = s.AddSubjects([]string{"did:plc:alice"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Backfill(ctx, 1)
+
+	waitFor(t, "alice to be backfilled", func() bool {
+		sub, _ := s.Subject("did:plc:alice")
+		return sub != nil && sub.BackfilledAt != nil
+	})
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.queries) != 0 {
+		t.Errorf("asked a labeler that is down: %v", f.queries)
+	}
+}
+
+func TestStreamLabelsAboutOtherAccountsAreSkippedBeforeTheirSignatureIsChecked(t *testing.T) {
+	f := newFakeLabeler(t)
+	m, s := setup(t, f)
+
+	// A forged label about an account nobody asked for is not even rejected:
+	// it is skipped before verification.
+	f.send(1, f.label("did:plc:stranger", "spam", false, true))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = m.Add(ctx, labelerDID)
+
+	waitFor(t, "the frame", func() bool {
+		l, _ := s.Labeler(labelerDID)
+		return l != nil && l.Cursor == 1
+	})
+
+	if l, _ := s.Labeler(labelerDID); l.Rejected != 0 || l.Received != 1 {
+		t.Errorf("received=%d rejected=%d, want 1 and 0", l.Received, l.Rejected)
 	}
 }

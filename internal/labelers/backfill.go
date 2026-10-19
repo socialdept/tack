@@ -88,9 +88,16 @@ func (m *Manager) backfillWorker(ctx context.Context) {
 			continue
 		}
 
-		checked, err := m.checkPendingURIs(ctx)
-		if err != nil {
-			m.Log.Warn("could not check pending record URIs", "err", err)
+		// Requests to each labeler are paced anyway, so workers checking the
+		// same URIs at once would only repeat each other.
+		checked := 0
+		if m.pendingMu.TryLock() {
+			checked, err = m.checkPendingURIs(ctx)
+			m.pendingMu.Unlock()
+
+			if err != nil {
+				m.Log.Warn("could not check pending record URIs", "err", err)
+			}
 		}
 
 		if checked > 0 {
@@ -134,9 +141,9 @@ func (m *Manager) release(did string) {
 }
 
 // backfillSubject asks every labeler for one subject's labels. A labeler
-// that cannot be reached is skipped and logged, so one that is down does not
-// hold every new subject back: its labels arrive through its stream once it
-// is back.
+// whose stream is not connected is skipped, and one that cannot be reached
+// is logged and skipped, so one that is down does not hold every new subject
+// back. Its new labels arrive through its stream once it is back.
 func (m *Manager) backfillSubject(ctx context.Context, did string) {
 	labelers, err := m.Store.Labelers()
 	if err != nil {
@@ -146,7 +153,7 @@ func (m *Manager) backfillSubject(ctx context.Context, did string) {
 	}
 
 	for _, l := range labelers {
-		if l.Status == "paused" {
+		if !answering(l) {
 			continue
 		}
 
@@ -188,6 +195,12 @@ func (m *Manager) backfillFrom(ctx context.Context, l store.Labeler, did string)
 	return nil
 }
 
+// answering is whether a labeler is worth asking: its stream is up, so its
+// queryLabels most likely is too.
+func answering(l store.Labeler) bool {
+	return l.Status == "connected"
+}
+
 func (m *Manager) setWildcards(did string, on bool) error {
 	return m.Store.UpdateLabeler(did, map[string]any{"wildcards": on})
 }
@@ -212,7 +225,7 @@ func (m *Manager) checkPendingURIs(ctx context.Context) (int, error) {
 
 	for _, l := range labelers {
 		// Labelers that take wildcards answered for every record already.
-		if l.Status == "paused" || (l.Wildcards != nil && *l.Wildcards) {
+		if !answering(l) || (l.Wildcards != nil && *l.Wildcards) {
 			continue
 		}
 

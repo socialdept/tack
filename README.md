@@ -48,6 +48,7 @@ docker run -p 2490:2490 -v tack-data:/data \
 | `TACK_QUERY_RATE` | `4` | `queryLabels` requests a second to each labeler |
 | `TACK_PLC_URL` | `https://plc.directory` | PLC directory for resolving DIDs |
 | `TACK_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `TACK_PPROF_ADDR` | | Serve Go's profiler at this address, such as `127.0.0.1:6060`. Off when unset. Keep it on localhost |
 
 On first start Tack follows `TACK_LABELERS`, or these:
 
@@ -135,7 +136,7 @@ When an account becomes a subject, Tack asks each labeler about it, paced to `TA
 
 Whether a labeler takes wildcards is found out on its first subject and remembered. Ozone, the labeler most services run, turns wildcards off unless its operator enables them, so expect exact URIs to be the common case. Labels applied while a subject is being fetched arrive over the stream, and the newest label for each value wins, whichever way it came.
 
-A labeler that cannot be reached while a subject is fetched is skipped, so one that is down does not hold every new subject back.
+A labeler whose stream is not connected, or that cannot be reached, is skipped while a subject is fetched, so one that is down does not hold every new subject back. Its new labels still arrive over its stream once it is back. One worker at a time asks about pending record URIs, since requests to each labeler are paced anyway.
 
 ## Storage
 
