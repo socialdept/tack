@@ -77,6 +77,7 @@ func run(log *slog.Logger) error {
 		AllSubjects: envBool("TACK_ALL_SUBJECTS", false),
 		Log:         log.With("part", "labelers"),
 		Notify:      deliverer.Wake,
+		QueryRate:   envFloat("TACK_QUERY_RATE", 4),
 	}
 
 	if err := manager.Start(ctx); err != nil {
@@ -89,9 +90,10 @@ func run(log *slog.Logger) error {
 		go deliverer.Run(ctx)
 	}
 
+	go manager.Backfill(ctx, envInt("TACK_BACKFILL_WORKERS", 4))
 	go sweep(ctx, s, log)
 
-	api := &server.Server{Context: ctx, Store: s, Labelers: manager, Password: os.Getenv("TACK_ADMIN_PASSWORD"), Wake: deliverer.Wake}
+	api := &server.Server{Context: ctx, Store: s, Labelers: manager, Password: os.Getenv("TACK_ADMIN_PASSWORD")}
 	if api.Password == "" {
 		log.Warn("TACK_ADMIN_PASSWORD is not set: the admin API is open to anyone who can reach it")
 	}
@@ -172,6 +174,14 @@ func env(key, fallback string) string {
 
 func envInt(key string, fallback int) int {
 	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
+		return v
+	}
+
+	return fallback
+}
+
+func envFloat(key string, fallback float64) float64 {
+	if v, err := strconv.ParseFloat(os.Getenv(key), 64); err == nil {
 		return v
 	}
 

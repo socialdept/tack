@@ -24,7 +24,6 @@ type Server struct {
 	Store    *store.Store
 	Labelers *labelers.Manager
 	Password string
-	Wake     func()
 }
 
 // Handler returns the routes.
@@ -40,6 +39,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /labelers/remove", s.auth(s.removeLabeler))
 	mux.HandleFunc("POST /subjects/add", s.auth(s.addSubjects))
 	mux.HandleFunc("POST /subjects/remove", s.auth(s.removeSubjects))
+	mux.HandleFunc("POST /subjects/uris", s.auth(s.addURIs))
 	mux.HandleFunc("GET /subjects/{did}", s.auth(s.subject))
 
 	return mux
@@ -138,45 +138,78 @@ func (s *Server) removeLabeler(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, map[string]string{"did": body.DID})
 }
 
+// addSubjects records accounts to deliver labels for. Their existing labels
+// are fetched from each labeler in the background. uris are record URIs of
+// theirs to ask about, for labelers that only answer for exact URIs.
 func (s *Server) addSubjects(w http.ResponseWriter, r *http.Request) {
-	dids, ok := readDIDs(w, r)
-	if !ok {
+	var body struct {
+		DIDs []string `json:"dids"`
+		URIs []string `json:"uris"`
+	}
+	if !read(w, r, &body) || !validDIDs(w, body.DIDs) {
 		return
 	}
 
-	added, queued, err := labelers.AddSubjects(s.Store, dids)
+	added, err := s.Store.AddSubjects(body.DIDs)
 	if err != nil {
 		fail(w, err)
 
 		return
 	}
 
-	if queued > 0 && s.Wake != nil {
-		s.Wake()
-	}
-
-	write(w, http.StatusOK, map[string]any{"added": len(added), "labelsQueued": queued})
-}
-
-func (s *Server) removeSubjects(w http.ResponseWriter, r *http.Request) {
-	dids, ok := readDIDs(w, r)
-	if !ok {
-		return
-	}
-
-	if err := s.Store.RemoveSubjects(dids); err != nil {
+	queued, err := s.Store.AddPendingURIs(body.URIs)
+	if err != nil {
 		fail(w, err)
 
 		return
 	}
 
-	write(w, http.StatusOK, map[string]any{"removed": len(dids)})
+	s.Labelers.WakeBackfill()
+	write(w, http.StatusOK, map[string]any{"added": len(added), "urisQueued": queued})
+}
+
+// addURIs queues record URIs of existing subjects to ask labelers about,
+// such as records the app indexed after adding the subject.
+func (s *Server) addURIs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		URIs []string `json:"uris"`
+	}
+	if !read(w, r, &body) {
+		return
+	}
+
+	queued, err := s.Store.AddPendingURIs(body.URIs)
+	if err != nil {
+		fail(w, err)
+
+		return
+	}
+
+	s.Labelers.WakeBackfill()
+	write(w, http.StatusOK, map[string]any{"urisQueued": queued})
+}
+
+func (s *Server) removeSubjects(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		DIDs []string `json:"dids"`
+	}
+	if !read(w, r, &body) || !validDIDs(w, body.DIDs) {
+		return
+	}
+
+	if err := s.Store.RemoveSubjects(body.DIDs); err != nil {
+		fail(w, err)
+
+		return
+	}
+
+	write(w, http.StatusOK, map[string]any{"removed": len(body.DIDs)})
 }
 
 func (s *Server) subject(w http.ResponseWriter, r *http.Request) {
 	did := r.PathValue("did")
 
-	tracked, err := s.Store.IsSubject(did)
+	subject, err := s.Store.Subject(did)
 	if err != nil {
 		fail(w, err)
 
@@ -195,26 +228,24 @@ func (s *Server) subject(w http.ResponseWriter, r *http.Request) {
 		payloads = append(payloads, labelers.FromStored(l))
 	}
 
-	write(w, http.StatusOK, map[string]any{"did": did, "subject": tracked, "labels": payloads})
+	var backfilledAt any
+	if subject != nil {
+		backfilledAt = subject.BackfilledAt
+	}
+
+	write(w, http.StatusOK, map[string]any{"did": did, "subject": subject != nil, "backfilledAt": backfilledAt, "labels": payloads})
 }
 
-func readDIDs(w http.ResponseWriter, r *http.Request) ([]string, bool) {
-	var body struct {
-		DIDs []string `json:"dids"`
-	}
-	if !read(w, r, &body) {
-		return nil, false
-	}
-
-	for _, did := range body.DIDs {
+func validDIDs(w http.ResponseWriter, dids []string) bool {
+	for _, did := range dids {
 		if _, err := syntax.ParseDID(did); err != nil {
 			write(w, http.StatusBadRequest, map[string]string{"error": "InvalidRequest", "message": "not a DID: " + did})
 
-			return nil, false
+			return false
 		}
 	}
 
-	return body.DIDs, true
+	return true
 }
 
 func read(w http.ResponseWriter, r *http.Request, into any) bool {

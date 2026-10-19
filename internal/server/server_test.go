@@ -68,28 +68,24 @@ func TestHealthIsOpenAndEverythingElseNeedsThePassword(t *testing.T) {
 	}
 }
 
-func TestAddingASubjectQueuesTheLabelsAlreadyStoredForIt(t *testing.T) {
+func TestAddingSubjectsQueuesTheirRecordURIs(t *testing.T) {
 	ts, s := setup(t)
-	_, _ = s.PutLabel(store.Label{Src: "did:plc:mod", URI: "at://did:plc:alice/app.bsky.feed.post/3k", Val: "spam", Subject: "did:plc:alice", Cts: "2026-01-01T00:00:00.000Z", Verified: true}, false)
-	_, _ = s.PutLabel(store.Label{Src: "did:plc:mod", URI: "did:plc:bob", Val: "spam", Subject: "did:plc:bob", Cts: "2026-01-01T00:00:00.000Z"}, false)
 
-	status, out := call(t, ts, "POST", "/subjects/add", `{"dids":["did:plc:alice"]}`, true)
-	if status != http.StatusOK || out["added"] != float64(1) || out["labelsQueued"] != float64(1) {
+	status, out := call(t, ts, "POST", "/subjects/add", `{"dids":["did:plc:alice"],"uris":["at://did:plc:alice/app.example.post/1","at://did:plc:bob/app.example.post/2"]}`, true)
+	if status != http.StatusOK || out["added"] != float64(1) || out["urisQueued"] != float64(1) {
 		t.Fatalf("add = %d %v", status, out)
 	}
 
-	// Adding it again queues nothing new.
-	if _, out := call(t, ts, "POST", "/subjects/add", `{"dids":["did:plc:alice"]}`, true); out["labelsQueued"] != float64(0) {
-		t.Errorf("second add queued %v", out["labelsQueued"])
+	if _, out := call(t, ts, "POST", "/subjects/uris", `{"uris":["at://did:plc:alice/app.example.post/3"]}`, true); out["urisQueued"] != float64(1) {
+		t.Errorf("uris = %v", out)
 	}
 
-	pending, _ := s.Pending(10)
-	if len(pending) != 1 {
-		t.Fatalf("pending = %d, want alice's label only", len(pending))
+	if pending, _ := s.PendingURIs(10); len(pending) != 2 {
+		t.Errorf("pending = %d, want alice's two records", len(pending))
 	}
 
 	_, out = call(t, ts, "GET", "/subjects/did:plc:alice", "", true)
-	if out["subject"] != true || len(out["labels"].([]any)) != 1 {
+	if out["subject"] != true || out["backfilledAt"] != nil {
 		t.Errorf("subject = %v", out)
 	}
 }
