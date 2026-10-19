@@ -8,10 +8,10 @@ Labelers label the whole network, each over its own websocket, and most only ans
 - **Keeps only what the app wants**: the newest label per labeler, subject and value, for the accounts the app registers as subjects. Labels about anyone else pass through without being stored.
 - **Fetches a new subject's existing labels** from each labeler with `com.atproto.label.queryLabels`: its account labels by DID, and its record labels with an `at://did/*` query where the labeler allows wildcards, or by the exact record URIs the app sends where it does not.
 - **Verifies signatures** against each labeler's `#atproto_label` key, refetching the DID document once when a key may have rotated.
-- **Delivers in batched webhooks** from an outbox, so nothing is lost while the app is down.
+- **Delivers the ways Tap does**: over a websocket with or without acknowledgements, or to a webhook one event or one batch per request, from an outbox, so nothing is lost while the app is down.
 - **Sends labeler declarations**, the `app.bsky.labeler.service` record with each labeler's values and default settings, when a labeler is added and when it changes.
 
-It runs beside [Tap](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) and uses the same webhook contract, so an app that takes Tap's batched webhooks takes Tack's the same way.
+It runs beside [Tap](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) and delivers the same ways, with the same settings, so an app that consumes Tap consumes Tack the same way.
 
 ## Running it
 
@@ -34,9 +34,13 @@ docker run -p 2490:2490 -v tack-data:/data \
 | --- | --- | --- |
 | `TACK_DATABASE_URL` | `sqlite://./data/tack.db` | `sqlite://path` or `postgres://...` |
 | `TACK_BIND` | `:2490` | Address of the admin API |
-| `TACK_ADMIN_PASSWORD` | | Basic auth password for the admin API and the webhook, with user `admin` |
-| `TACK_WEBHOOK_URL` | | Where batches are delivered. Without it, labels are stored and queued but not sent |
-| `TACK_WEBHOOK_BATCH_SIZE` | `100` | Events per batch |
+| `TACK_ADMIN_PASSWORD` | | Basic auth password for the admin API, `/channel` and the webhook, with user `admin` |
+| `TACK_WEBHOOK_URL` | | Deliver to this webhook. Without it, events go over the websocket at `/channel` |
+| `TACK_WEBHOOK_BATCH_SIZE` | `0` | Events per webhook request as `{"events": [...]}`, or `0` for one event per request |
+| `TACK_WEBHOOK_BATCH_FLUSH` | `500ms` | Longest a partial batch waits for more events |
+| `TACK_WEBHOOK_BATCH_PARALLELISM` | `1` | Webhook requests in flight at once |
+| `TACK_DISABLE_ACKS` | `false` | On the websocket, count an event as delivered once it is written, without waiting for an ack |
+| `TACK_RETRY_TIMEOUT` | `60s` | How long an event sent over the websocket waits for its ack before it is sent again |
 | `TACK_LABELERS` | four, below | Comma-separated labeler DIDs to follow on first start |
 | `TACK_VERIFY` | `true` | Drop labels whose signature does not verify |
 | `TACK_ALL_SUBJECTS` | `false` | Deliver every label from the streams, about any account, without storing any |
@@ -56,37 +60,36 @@ On first start Tack follows `TACK_LABELERS`, or these:
 
 After that the admin API decides, so a labeler removed through it stays removed across restarts.
 
-## Webhook
+## Delivery
 
-Batches are POSTed as JSON with basic auth (`admin` and `TACK_ADMIN_PASSWORD`). A 2xx acknowledges the whole batch. Anything else, or no answer, and the batch is sent again, with the same ids, after a backoff. One batch is in flight at a time, so events arrive in order. Delivery is at least once: an app should apply events idempotently.
+Events wait in an outbox until the app acknowledges them, so nothing is lost while it is down. Delivery is at least once: an app should apply events idempotently. Every mode sends the same event JSON:
 
 ```json
 {
-  "events": [
-    {
-      "id": 1042,
-      "type": "label",
-      "label": {
-        "src": "did:plc:ar7c4by46qjdydhdevvrndac",
-        "uri": "at://did:plc:abc/app.bsky.feed.post/3k...",
-        "cid": "bafy...",
-        "val": "graphic-media",
-        "neg": false,
-        "cts": "2026-10-19T12:00:00.000Z",
-        "exp": null
-      },
-      "verified": true
-    },
-    {
-      "id": 1043,
-      "type": "labeler",
-      "labeler": {
-        "did": "did:plc:ar7c4by46qjdydhdevvrndac",
-        "endpoint": "https://mod.bsky.app",
-        "declaration": { "$type": "app.bsky.labeler.service", "policies": { "labelValues": ["..."] } }
-      }
-    }
-  ]
+  "id": 1042,
+  "type": "label",
+  "label": {
+    "src": "did:plc:ar7c4by46qjdydhdevvrndac",
+    "uri": "at://did:plc:abc/app.bsky.feed.post/3k...",
+    "cid": "bafy...",
+    "val": "graphic-media",
+    "neg": false,
+    "cts": "2026-10-19T12:00:00.000Z",
+    "exp": null
+  },
+  "verified": true
+}
+```
+
+```json
+{
+  "id": 1043,
+  "type": "labeler",
+  "labeler": {
+    "did": "did:plc:ar7c4by46qjdydhdevvrndac",
+    "endpoint": "https://mod.bsky.app",
+    "declaration": { "$type": "app.bsky.labeler.service", "policies": { "labelValues": ["..."] } }
+  }
 }
 ```
 
@@ -95,6 +98,16 @@ Batches are POSTed as JSON with basic auth (`admin` and `TACK_ADMIN_PASSWORD`). 
 - `verified` is false only when `TACK_VERIFY=false`.
 - A `labeler` event with `"removed": true` means the labeler was removed and the app may drop its labels.
 
+The mode is picked as Tap picks it:
+
+| Mode | When | How |
+| --- | --- | --- |
+| Websocket with acks | No `TACK_WEBHOOK_URL` (the default) | Connect to `GET /channel`. Each event is a text message. Answer each with `{"type": "ack", "id": 1042}`. An event not acknowledged within `TACK_RETRY_TIMEOUT` is sent again, and one sent on a connection that closes goes to the next |
+| Websocket, fire and forget | No `TACK_WEBHOOK_URL`, `TACK_DISABLE_ACKS=true` | The same, without acks: an event is delivered once it is written |
+| Webhook | `TACK_WEBHOOK_URL` set | POSTed with basic auth. A 2xx acknowledges. Anything else, or no answer, and it is sent again, with the same ids, after a backoff. One event per request, or batches as `{"events": [...]}` with `TACK_WEBHOOK_BATCH_SIZE` |
+
+One websocket client connects at a time, and one webhook request is in flight at a time unless `TACK_WEBHOOK_BATCH_PARALLELISM` raises it, so events arrive in order. With parallel requests they may not, and the app should keep the newest label for each value by `cts`.
+
 ## Admin API
 
 Every route but `/health` needs basic auth.
@@ -102,6 +115,7 @@ Every route but `/health` needs basic auth.
 | Route | |
 | --- | --- |
 | `GET /health` | `{"status":"ok"}` |
+| `GET /channel` | The websocket delivery, when no webhook is set |
 | `GET /stats` | Counts of labelers, labels, subjects and queued events |
 | `GET /labelers` | Each labeler with its state, cursor, labels received and rejected, and declaration |
 | `POST /labelers/add` | `{"did": "did:plc:..."}`, follow a labeler |
