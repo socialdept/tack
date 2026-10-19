@@ -142,7 +142,9 @@ func SubjectOf(uri string) string {
 // changed, so a replayed label is not delivered twice.
 func (s *Store) PutLabel(l Label, negated bool) (bool, error) {
 	if negated {
-		res := s.DB.Where("src = ? AND uri = ? AND val = ?", l.Src, l.URI, l.Val).Delete(&Label{})
+		// Only a withdrawal at least as new as the label removes it, so one
+		// that arrives late cannot remove a label applied again since.
+		res := s.DB.Where("src = ? AND uri = ? AND val = ? AND cts <= ?", l.Src, l.URI, l.Val, l.Cts).Delete(&Label{})
 
 		return res.RowsAffected > 0, res.Error
 	}

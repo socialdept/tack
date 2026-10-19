@@ -193,3 +193,21 @@ func TestSubjectsAreBackfilledOnceAndRemovingOneForgetsItsLabels(t *testing.T) {
 		t.Errorf("labels kept after removal: %+v", labels)
 	}
 }
+
+func TestALateWithdrawalDoesNotRemoveALabelAppliedAgain(t *testing.T) {
+	s := open(t)
+	label := Label{Src: "did:plc:mod", URI: "did:plc:alice", Val: "spam", Subject: "did:plc:alice", Cts: "2026-03-01T00:00:00.000Z"}
+	_, _ = s.PutLabel(label, false)
+
+	old := label
+	old.Cts = "2026-02-01T00:00:00.000Z"
+	if changed, _ := s.PutLabel(old, true); changed {
+		t.Error("an older withdrawal removed a newer label")
+	}
+
+	newer := label
+	newer.Cts = "2026-04-01T00:00:00.000Z"
+	if changed, _ := s.PutLabel(newer, true); !changed {
+		t.Error("a newer withdrawal did not remove the label")
+	}
+}
