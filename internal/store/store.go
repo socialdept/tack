@@ -58,9 +58,9 @@ type Subject struct {
 // PendingURI is a record of a subject whose existing labels are still to be
 // asked for, from labelers that only answer for exact URIs.
 type PendingURI struct {
-	URI       string `gorm:"column:uri;primaryKey"`
-	Subject   string `gorm:"index"`
-	CreatedAt time.Time
+	URI       string    `gorm:"column:uri;primaryKey;index:idx_pending_order,priority:2"`
+	Subject   string    `gorm:"index"`
+	CreatedAt time.Time `gorm:"index:idx_pending_order,priority:1"`
 }
 
 // Event waits in the outbox until a webhook delivery is acknowledged.
