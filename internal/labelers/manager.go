@@ -25,6 +25,7 @@ import (
 	"github.com/bluesky-social/indigo/events/schedulers/sequential"
 	"github.com/gorilla/websocket"
 	"github.com/socialdept/tack/internal/store"
+	"golang.org/x/time/rate"
 )
 
 // Manager runs one subscription per labeler.
@@ -44,8 +45,15 @@ type Manager struct {
 	// read again. Six hours when zero.
 	DeclarationEvery time.Duration
 
-	mu      sync.Mutex
-	running map[string]context.CancelFunc
+	// QueryRate is how many queryLabels requests a second each labeler
+	// gets while backfilling. Four when zero.
+	QueryRate float64
+
+	mu           sync.Mutex
+	running      map[string]context.CancelFunc
+	backfillWake chan struct{}
+	inFlight     map[string]bool
+	limiters     map[string]*rate.Limiter
 }
 
 // Start runs every stored labeler.
@@ -434,12 +442,7 @@ func (m *Manager) refreshDeclaration(ctx context.Context, did string, who *label
 		return err
 	}
 
-	client := m.HTTP
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-
-	resp, err := client.Do(req)
+	resp, err := m.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
