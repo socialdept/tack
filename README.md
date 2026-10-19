@@ -2,13 +2,13 @@
 
 Tack follows atproto labelers and delivers the labels an app cares about.
 
-Labelers label the whole network over a websocket each, and only answer label queries for exact URIs. An app that wants the labels on the accounts it indexes, including labels applied before it started indexing them, would have to hold a connection to every labeler and keep everything they ever emitted. Tack does that job:
+Labelers label the whole network, each over its own websocket, and most only answer label queries for exact URIs. An app that wants the labels on the accounts it indexes, including labels applied before it started indexing them, would have to hold a connection to every labeler and keep track of what each one says about each account. Tack does that job:
 
-- **Follows labelers** over `com.atproto.label.subscribeLabels`, resuming from a saved cursor, reconnecting with backoff.
-- **Keeps every label** they emit, newest per labeler, subject and value, dropping negated and expired ones.
+- **Follows labelers** over `com.atproto.label.subscribeLabels`, from their current label onward, resuming from a saved cursor after a restart and reconnecting with backoff.
+- **Keeps only what the app wants**: the newest label per labeler, subject and value, for the accounts the app registers as subjects. Labels about anyone else pass through without being stored.
+- **Fetches a new subject's existing labels** from each labeler with `com.atproto.label.queryLabels`: its account labels by DID, and its record labels with an `at://did/*` query where the labeler allows wildcards, or by the exact record URIs the app sends where it does not.
 - **Verifies signatures** against each labeler's `#atproto_label` key, refetching the DID document once when a key may have rotated.
-- **Delivers only what the app wants**: labels about its subjects, in batched webhooks with an outbox, so nothing is lost while the app is down.
-- **Backfills new subjects**: adding an account delivers every label already held for it.
+- **Delivers in batched webhooks** from an outbox, so nothing is lost while the app is down.
 - **Sends labeler declarations**, the `app.bsky.labeler.service` record with each labeler's values and default settings, when a labeler is added and when it changes.
 
 It runs beside [Tap](https://github.com/bluesky-social/indigo/tree/main/cmd/tap) and uses the same webhook contract, so an app that takes Tap's batched webhooks takes Tack's the same way.
@@ -39,7 +39,9 @@ docker run -p 2490:2490 -v tack-data:/data \
 | `TACK_WEBHOOK_BATCH_SIZE` | `100` | Events per batch |
 | `TACK_LABELERS` | four, below | Comma-separated labeler DIDs to follow on first start |
 | `TACK_VERIFY` | `true` | Drop labels whose signature does not verify |
-| `TACK_ALL_SUBJECTS` | `false` | Deliver labels about every account, not only subjects |
+| `TACK_ALL_SUBJECTS` | `false` | Deliver every label from the streams, about any account, without storing any |
+| `TACK_BACKFILL_WORKERS` | `4` | Subjects fetched at once |
+| `TACK_QUERY_RATE` | `4` | `queryLabels` requests a second to each labeler |
 | `TACK_PLC_URL` | `https://plc.directory` | PLC directory for resolving DIDs |
 | `TACK_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
@@ -104,13 +106,28 @@ Every route but `/health` needs basic auth.
 | `GET /labelers` | Each labeler with its state, cursor, labels received and rejected, and declaration |
 | `POST /labelers/add` | `{"did": "did:plc:..."}`, follow a labeler |
 | `POST /labelers/remove` | `{"did": "did:plc:..."}`, stop following it and forget its labels |
-| `POST /subjects/add` | `{"dids": [...]}`, deliver labels about these accounts, starting with those already held |
-| `POST /subjects/remove` | `{"dids": [...]}`, stop delivering labels about them |
-| `GET /subjects/{did}` | Whether a DID is a subject, and the live labels about it |
+| `POST /subjects/add` | `{"dids": [...], "uris": [...]}`, deliver labels about these accounts, starting with those they already have. `uris` are their record URIs, for labelers that only answer for exact URIs |
+| `POST /subjects/uris` | `{"uris": [...]}`, more record URIs of existing subjects to ask about, such as records indexed later |
+| `POST /subjects/remove` | `{"dids": [...]}`, stop delivering labels about them and forget theirs |
+| `GET /subjects/{did}` | Whether a DID is a subject, when its labels were fetched, and the live labels about it |
+
+## Fetching existing labels
+
+When an account becomes a subject, Tack asks each labeler about it, paced to `TACK_QUERY_RATE`:
+
+| | Asked with |
+| --- | --- |
+| Account labels | The DID and its `app.bsky.actor.profile/self` record, exactly, from every labeler |
+| Record labels, labeler takes wildcards | `at://did/*`, every page |
+| Record labels, labeler does not | The exact record URIs the app sent, 100 at a time |
+
+Whether a labeler takes wildcards is found out on its first subject and remembered. Ozone, the labeler most services run, turns wildcards off unless its operator enables them, so expect exact URIs to be the common case. Labels applied while a subject is being fetched arrive over the stream, and the newest label for each value wins, whichever way it came.
+
+A labeler that cannot be reached while a subject is fetched is skipped, so one that is down does not hold every new subject back.
 
 ## Storage
 
-Tack keeps the newest label for each labeler, subject and value, so its size follows the number of labels in force, not the number ever emitted. Negations delete, and expired labels are swept hourly. SQLite is enough for the default labelers, and Postgres is there for more.
+Tack stores labels about subjects only, so its size follows the accounts the app indexes, not the network. Negations delete, expired labels are swept hourly, and removing a subject removes its labels.
 
 ## License
 
