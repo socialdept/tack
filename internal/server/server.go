@@ -80,6 +80,7 @@ type labelerView struct {
 	Cursor      int64           `json:"cursor"`
 	Received    int64           `json:"received"`
 	Rejected    int64           `json:"rejected"`
+	Wildcards   *bool           `json:"wildcards"`
 	ConnectedAt any             `json:"connectedAt"`
 	Declaration json.RawMessage `json:"declaration,omitempty"`
 }
@@ -94,7 +95,7 @@ func (s *Server) listLabelers(w http.ResponseWriter, r *http.Request) {
 
 	views := make([]labelerView, 0, len(rows))
 	for _, l := range rows {
-		v := labelerView{DID: l.DID, Endpoint: l.Endpoint, Status: l.Status, LastError: l.LastError, Cursor: l.Cursor, Received: l.Received, Rejected: l.Rejected, ConnectedAt: l.ConnectedAt}
+		v := labelerView{DID: l.DID, Endpoint: l.Endpoint, Status: l.Status, LastError: l.LastError, Cursor: l.Cursor, Received: l.Received, Rejected: l.Rejected, Wildcards: l.Wildcards, ConnectedAt: l.ConnectedAt}
 		if l.Declaration != "" {
 			v.Declaration = json.RawMessage(l.Declaration)
 		}
