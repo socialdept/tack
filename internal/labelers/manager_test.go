@@ -28,12 +28,13 @@ const labelerDID = "did:plc:labeler"
 
 // fakeLabeler serves a labeler's PDS (its declaration) and its label stream.
 type fakeLabeler struct {
-	t       *testing.T
-	key     *atcrypto.PrivateKeyK256
-	server  *httptest.Server
-	mu      sync.Mutex
-	frames  [][]byte
-	cursors []string
+	t           *testing.T
+	declaration string
+	key         *atcrypto.PrivateKeyK256
+	server      *httptest.Server
+	mu          sync.Mutex
+	frames      [][]byte
+	cursors     []string
 }
 
 func newFakeLabeler(t *testing.T) *fakeLabeler {
@@ -49,7 +50,13 @@ func newFakeLabeler(t *testing.T) *fakeLabeler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/xrpc/com.atproto.repo.getRecord", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"uri":"at://did:plc:labeler/app.bsky.labeler.service/self","value":{"$type":"app.bsky.labeler.service","policies":{"labelValues":["spam"]}}}`)
+		f.mu.Lock()
+		values := f.declaration
+		f.mu.Unlock()
+		if values == "" {
+			values = `["spam"]`
+		}
+		_, _ = io.WriteString(w, `{"uri":"at://did:plc:labeler/app.bsky.labeler.service/self","value":{"$type":"app.bsky.labeler.service","policies":{"labelValues":`+values+`}}}`)
 	})
 	mux.HandleFunc("/xrpc/com.atproto.label.subscribeLabels", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -312,4 +319,28 @@ func TestRemovingALabelerTellsTheApp(t *testing.T) {
 	if last["type"] != "labeler" || last["labeler"].(map[string]any)["removed"] != true {
 		t.Errorf("last event %v, want the labeler removed", last)
 	}
+}
+
+func TestAChangedDeclarationIsSentWhileConnected(t *testing.T) {
+	f := newFakeLabeler(t)
+	m, s := setup(t, f)
+	m.DeclarationEvery = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = m.Add(ctx, labelerDID)
+
+	waitFor(t, "the first declaration", func() bool { return len(queued(t, s)) == 1 })
+
+	// Unchanged: nothing more is sent.
+	time.Sleep(150 * time.Millisecond)
+	if n := len(queued(t, s)); n != 1 {
+		t.Fatalf("%d events for an unchanged declaration", n)
+	}
+
+	f.mu.Lock()
+	f.declaration = `["spam","scam"]`
+	f.mu.Unlock()
+
+	waitFor(t, "the changed declaration", func() bool { return len(queued(t, s)) == 2 })
 }

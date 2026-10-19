@@ -40,6 +40,10 @@ type Manager struct {
 	// Notify is called after events are queued, to wake the webhook.
 	Notify func()
 
+	// DeclarationEvery is how often a connected labeler's declaration is
+	// read again. Six hours when zero.
+	DeclarationEvery time.Duration
+
 	mu      sync.Mutex
 	running map[string]context.CancelFunc
 }
@@ -222,6 +226,24 @@ func (m *Manager) subscribe(ctx context.Context, did string, log *slog.Logger) e
 		_ = conn.Close()
 	}()
 
+	// Labelers add and redefine values while connected, so the declaration
+	// is read again every few hours, not only on connect.
+	go func() {
+		ticker := time.NewTicker(m.declarationEvery())
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := m.refreshDeclaration(ctx, did, who); err != nil {
+					log.Warn("could not read the labeler declaration", "err", err)
+				}
+			}
+		}
+	}()
+
 	callbacks := &events.RepoStreamCallbacks{
 		LabelLabels: func(evt *comatproto.LabelSubscribeLabels_Labels) error {
 			return m.handleLabels(ctx, did, who, evt)
@@ -238,6 +260,14 @@ func (m *Manager) subscribe(ctx context.Context, did string, log *slog.Logger) e
 	}
 
 	return events.HandleRepoStream(ctx, conn, sequential.NewScheduler(did, callbacks.EventHandler), log)
+}
+
+func (m *Manager) declarationEvery() time.Duration {
+	if m.DeclarationEvery > 0 {
+		return m.DeclarationEvery
+	}
+
+	return 6 * time.Hour
 }
 
 func (m *Manager) dialer() *websocket.Dialer {
