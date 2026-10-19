@@ -149,3 +149,47 @@ func TestRemovingALabelerForgetsItsLabels(t *testing.T) {
 		t.Errorf("counts = %v", counts)
 	}
 }
+
+func TestPendingURIsAreOnlyKeptForSubjects(t *testing.T) {
+	s := open(t)
+	_, _ = s.AddSubjects([]string{"did:plc:alice"})
+
+	queued, err := s.AddPendingURIs([]string{
+		"at://did:plc:alice/app.example.post/1",
+		"at://did:plc:alice/app.example.post/1",
+		"at://did:plc:stranger/app.example.post/2",
+		"did:plc:alice",
+	})
+	if err != nil || queued != 1 {
+		t.Fatalf("queued=%d err=%v, want only alice's record, once", queued, err)
+	}
+
+	pending, _ := s.PendingURIs(10)
+	_ = s.DonePendingURIs([]string{pending[0].URI})
+
+	if left, _ := s.PendingURIs(10); len(left) != 0 {
+		t.Errorf("left = %+v", left)
+	}
+}
+
+func TestSubjectsAreBackfilledOnceAndRemovingOneForgetsItsLabels(t *testing.T) {
+	s := open(t)
+	_, _ = s.AddSubjects([]string{"did:plc:alice"})
+
+	next, _ := s.NextUnbackfilled()
+	if next == nil || next.DID != "did:plc:alice" {
+		t.Fatalf("next = %+v", next)
+	}
+
+	_ = s.MarkBackfilled("did:plc:alice")
+	if next, _ := s.NextUnbackfilled(); next != nil {
+		t.Errorf("alice is still waiting: %+v", next)
+	}
+
+	_, _ = s.PutLabel(Label{Src: "did:plc:mod", URI: "did:plc:alice", Val: "spam", Subject: "did:plc:alice", Cts: "2026-01-01T00:00:00.000Z"}, false)
+	_ = s.RemoveSubjects([]string{"did:plc:alice"})
+
+	if labels, _ := s.LabelsFor("did:plc:alice"); len(labels) != 0 {
+		t.Errorf("labels kept after removal: %+v", labels)
+	}
+}

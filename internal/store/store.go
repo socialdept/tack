@@ -1,6 +1,6 @@
-// Package store keeps what Tack knows: the labelers it follows, every label
-// they have emitted, the subjects the app cares about, and the events waiting
-// to be delivered.
+// Package store keeps what Tack knows: the labelers it follows, the labels
+// about the subjects the app cares about, the record URIs still to be checked
+// for labels, and the events waiting to be delivered.
 package store
 
 import (
@@ -27,8 +27,11 @@ type Labeler struct {
 	ConnectedAt *time.Time
 	Received    int64 // labels received since it was added
 	Rejected    int64 // labels dropped for a bad signature or syntax
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// Wildcards is whether queryLabels takes at://did/* patterns. Nil until
+	// asked once.
+	Wildcards *bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Label is the newest label a labeler emitted for one value on one subject.
@@ -44,9 +47,19 @@ type Label struct {
 	Verified bool
 }
 
-// Subject is an account the app wants labels for.
+// Subject is an account the app wants labels for. Its existing labels are
+// fetched from each labeler once, after it is added.
 type Subject struct {
-	DID       string `gorm:"column:did;primaryKey"`
+	DID          string `gorm:"column:did;primaryKey"`
+	CreatedAt    time.Time
+	BackfilledAt *time.Time `gorm:"index"`
+}
+
+// PendingURI is a record of a subject whose existing labels are still to be
+// asked for, from labelers that only answer for exact URIs.
+type PendingURI struct {
+	URI       string `gorm:"column:uri;primaryKey"`
+	Subject   string `gorm:"index"`
 	CreatedAt time.Time
 }
 
@@ -95,7 +108,7 @@ func Open(url string) (*Store, error) {
 		sqlDB.SetMaxOpenConns(1)
 	}
 
-	if err := db.AutoMigrate(&Labeler{}, &Label{}, &Subject{}, &Event{}); err != nil {
+	if err := db.AutoMigrate(&Labeler{}, &Label{}, &Subject{}, &PendingURI{}, &Event{}); err != nil {
 		return nil, fmt.Errorf("migrating: %w", err)
 	}
 
@@ -176,10 +189,95 @@ func (s *Store) AddSubjects(dids []string) ([]string, error) {
 	return added, nil
 }
 
-// RemoveSubjects forgets DIDs as subjects. Their labels are kept, so adding
-// them again delivers them again.
+// RemoveSubjects forgets DIDs as subjects, with their labels and pending
+// URIs. Adding one again fetches its labels again.
 func (s *Store) RemoveSubjects(dids []string) error {
-	return s.DB.Where("did IN ?", dids).Delete(&Subject{}).Error
+	return s.Tx(func(tx *Store) error {
+		for _, model := range []any{&Label{}, &PendingURI{}} {
+			if err := tx.DB.Where("subject IN ?", dids).Delete(model).Error; err != nil {
+				return err
+			}
+		}
+
+		return tx.DB.Where("did IN ?", dids).Delete(&Subject{}).Error
+	})
+}
+
+// AddPendingURIs queues record URIs to be checked for labels. URIs whose
+// account is not a subject are left out. It returns how many were queued.
+func (s *Store) AddPendingURIs(uris []string) (int, error) {
+	queued := 0
+	now := time.Now().UTC()
+
+	for _, uri := range uris {
+		subject := SubjectOf(uri)
+
+		ok, err := s.IsSubject(subject)
+		if err != nil {
+			return queued, err
+		}
+
+		if !ok || !strings.HasPrefix(uri, "at://") {
+			continue
+		}
+
+		res := s.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&PendingURI{URI: uri, Subject: subject, CreatedAt: now})
+		if res.Error != nil {
+			return queued, res.Error
+		}
+
+		queued += int(res.RowsAffected)
+	}
+
+	return queued, nil
+}
+
+// PendingURIs returns the oldest record URIs waiting to be checked.
+func (s *Store) PendingURIs(limit int) ([]PendingURI, error) {
+	var uris []PendingURI
+	err := s.DB.Order("created_at, uri").Limit(limit).Find(&uris).Error
+
+	return uris, err
+}
+
+// DonePendingURIs drops checked URIs.
+func (s *Store) DonePendingURIs(uris []string) error {
+	if len(uris) == 0 {
+		return nil
+	}
+
+	return s.DB.Where("uri IN ?", uris).Delete(&PendingURI{}).Error
+}
+
+// NextUnbackfilled returns a subject whose labels have not been fetched yet.
+func (s *Store) NextUnbackfilled() (*Subject, error) {
+	var subject Subject
+
+	err := s.DB.Where("backfilled_at IS NULL").Order("created_at, did").Take(&subject).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+
+	return &subject, err
+}
+
+// MarkBackfilled records that a subject's labels have been fetched.
+func (s *Store) MarkBackfilled(did string) error {
+	now := time.Now().UTC()
+
+	return s.DB.Model(&Subject{}).Where("did = ?", did).Update("backfilled_at", &now).Error
+}
+
+// Subject returns one subject, or nil.
+func (s *Store) Subject(did string) (*Subject, error) {
+	var subject Subject
+
+	err := s.DB.Where("did = ?", did).Take(&subject).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+
+	return &subject, err
 }
 
 // LabelsFor returns every live label about a subject.
@@ -234,7 +332,7 @@ func (s *Store) Labeler(did string) (*Labeler, error) {
 func (s *Store) Counts() (map[string]int64, error) {
 	counts := map[string]int64{}
 
-	for name, model := range map[string]any{"labelers": &Labeler{}, "labels": &Label{}, "subjects": &Subject{}, "outbox": &Event{}} {
+	for name, model := range map[string]any{"labelers": &Labeler{}, "labels": &Label{}, "subjects": &Subject{}, "pendingUris": &PendingURI{}, "outbox": &Event{}} {
 		var n int64
 		if err := s.DB.Model(model).Count(&n).Error; err != nil {
 			return nil, err
